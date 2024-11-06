@@ -3,6 +3,9 @@ import os
 import sys
 import pickle
 import csv
+from thop import profile
+from thop import clever_format
+import time
 sys.path.append(os.getcwd())
 from utils import *
 from motion_pred.utils.config import Config
@@ -45,6 +48,21 @@ def denomarlize(*data):
     return out
 
 
+class OneGSPS(torch.nn.Module):
+    def __init__(self, gsps, cfg, idct_m_all):
+        super().__init__()
+        self.gsps = gsps
+        self.cfg = cfg
+        self.idct_m_all = idct_m_all
+    
+    def forward(self, inp, z):
+        Y = self.gsps(inp, z)
+        Y = Y.reshape([Y.shape[0], Y.shape[1], 3, self.cfg.n_pre]).reshape(
+            [Y.shape[0], Y.shape[1] * 3, self.cfg.n_pre]).transpose(1, 2)
+        Y = torch.matmul(self.idct_m_all[:, :self.cfg.n_pre], Y[:, :self.cfg.n_pre]).transpose(1, 2)[:, :, t_his:]
+        return Y
+    
+
 def get_prediction(data, algo, sample_num, num_seeds=1, concat_hist=True, z=None):
     dct_m, idct_m = util.get_dct_matrix(t_pred + t_his)
     dct_m_all = dct_m.float().to(device)
@@ -60,18 +78,30 @@ def get_prediction(data, algo, sample_num, num_seeds=1, concat_hist=True, z=None
         reshape([bs, nj, 3, -1]).reshape([bs, nj, -1])
     inp = inp.unsqueeze(1).repeat([1, cfg.nk, 1, 1]).reshape([bs * cfg.nk, nj, -1])
 
-    # # sample diverse z
-    # z = torch.randn([1, 3, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    # threshold = 30
-    # max_search_step = 1000
-    # for kk in range(sample_num * num_seeds - 1):
-    #     zt = torch.randn([max_search_step, 3, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    #     dist = torch.norm(zt[:, None, :, :] - z[None, :, :, :], dim=-1).mean(dim=[1, 2])
-    #     zt = zt[dist == torch.max(dist)][0]
-    #     z = torch.cat([zt[None, :, :], z], dim=0)
-    # # z = z.reshape([sample_num * num_seeds, X.shape[1], -1])
-    # zz = torch.randn([sample_num * num_seeds, 2, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    # z = torch.cat([zz, z], dim=1)
+
+    gsps_one = OneGSPS(models['gcn'], cfg, idct_m_all)
+    z = torch.randn([sample_num * num_seeds, n_parts, cfg.nf_specs['nz']], dtype=dtype, device=device)
+    if args.fixlower:
+        z[:, 0] = z[:1, 0]
+        
+    macs, params = profile(gsps_one, inputs=(inp, z))
+    macs, params = clever_format([macs, params], "%.3f")
+    print("flops = ", macs * 2) 
+    print("params = ", params)
+    
+    print('warm up ... \n')
+    for _ in range(10):
+        start = time.time()
+        outputs = gsps_one(inp, z)
+        torch.cuda.synchronize()
+        end = time.time()
+        print('Time:{}ms'.format((end-start)*1000))
+
+    with torch.autograd.profiler.profile(enabled=True, use_cuda=True, record_shapes=False, profile_memory=False) as prof:
+        outputs = gsps_one(inp, z)
+    print(prof.key_averages().table(sort_by="cuda_time_total")) 
+
+
     if algo == 'gcn':
         z = torch.randn([sample_num * num_seeds, n_parts, cfg.nf_specs['nz']], dtype=dtype, device=device)
         if args.fixlower:

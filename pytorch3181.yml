@@ -192,4 +192,4 @@ dependencies:
     - wcwidth==0.2.5
     - webencodings==0.5.1
     - widgetsnbextension==3.5.1
-prefix: /home/wei/anaconda3/envs/pytorch3181
+prefix: E:\Anaconda3\envs\pytorch3181

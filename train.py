@@ -339,7 +339,7 @@ if __name__ == '__main__':
     parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--iter', type=int, default=0)
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--gpu_index', type=int, default=1)
+    parser.add_argument('--gpu_index', type=int, default=0)
     parser.add_argument('--n_pre', type=int, default=8)
     parser.add_argument('--n_his', type=int, default=5)
     parser.add_argument('--trial', type=int, default=1)
