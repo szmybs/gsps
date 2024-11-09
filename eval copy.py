@@ -90,12 +90,18 @@ def get_prediction(data, algo, sample_num, num_seeds=1, concat_hist=True, z=None
     print("params = ", params)
     
     print('warm up ... \n')
+    runtime_cost_list = []
     for _ in range(10):
         start = time.time()
         outputs = gsps_one(inp, z)
         torch.cuda.synchronize()
         end = time.time()
         print('Time:{}ms'.format((end-start)*1000))
+        runtime_cost_list.append((end-start)*1000)
+    runtime_cost = np.array(runtime_cost_list)
+    runtime_mean, runtime_std = np.mean(runtime_cost), np.std(runtime_cost)
+    print(runtime_mean)
+    print(runtime_std)
 
     with torch.autograd.profiler.profile(enabled=True, use_cuda=True, record_shapes=False, profile_memory=False) as prof:
         outputs = gsps_one(inp, z)
@@ -416,8 +422,8 @@ if __name__ == '__main__':
 
     all_algos = ['gcn']
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg',
-                        default='h36m')
+    parser.add_argument('--cfg', default='h36m')
+    # parser.add_argument('--cfg', default='humaneva')
     parser.add_argument('--mode', default='stats')
     parser.add_argument('--data', default='test')
     parser.add_argument('--action', default='all')

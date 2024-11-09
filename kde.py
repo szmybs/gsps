@@ -3,6 +3,9 @@ import os
 import sys
 import pickle
 import csv
+from thop import profile
+from thop import clever_format
+import time
 sys.path.append(os.getcwd())
 from utils import *
 from motion_pred.utils.config import Config
@@ -14,6 +17,148 @@ from scipy.spatial.distance import pdist, squareform
 from models import LinNF
 
 from utils import util
+
+from abc import ABC
+from typing import Optional, List
+import math
+from torch import Tensor
+
+
+
+def kde(y, y_pred):
+    y, y_pred = torch.from_numpy(y).float().to(torch.device('cuda')), torch.from_numpy(y_pred).float().to(torch.device('cuda'))
+    bs, sp, ts, ns, d = y_pred.shape
+    kde_ll = torch.zeros((bs, ts, ns), device=y_pred.device)
+
+    for b in range(bs):
+        for t in range(ts):
+            for n in range(ns):
+                try:
+                    kernel = GaussianKDE(y_pred[b, :, t, n, :])
+                except BaseException:
+                    print("b: %d - t: %d - n: %d" % (b, t, n))
+                    continue
+                # pred_prob = kernel(y_pred[:, b, t, :, n])
+                gt_prob = kernel(y[b, None, t, n, :])
+                kde_ll[b, t, n] = gt_prob
+    # mean_kde_ll = torch.mean(kde_ll)
+    mean_kde_ll = torch.mean(torch.mean(kde_ll, dim=-1), dim=0)[None]
+    return mean_kde_ll
+
+  
+class DynamicBufferModule(ABC, torch.nn.Module):
+    """Torch module that allows loading variables from the state dict even in the case of shape mismatch."""
+    
+    def get_tensor_attribute(self, attribute_name: str) -> Tensor:
+        """Get attribute of the tensor given the name.
+        Args:
+            attribute_name (str): Name of the tensor
+        Raises:
+            ValueError: `attribute_name` is not a torch Tensor
+        Returns:
+            Tensor: Tensor attribute
+        """
+        attribute = getattr(self, attribute_name)
+        if isinstance(attribute, Tensor):
+            return attribute
+        raise ValueError(f"Attribute with name '{attribute_name}' is not a torch Tensor")
+
+    def _load_from_state_dict(self, state_dict: dict, prefix: str, *args):
+        """Resizes the local buffers to match those stored in the state dict.
+        Overrides method from parent class.
+        Args:
+          state_dict (dict): State dictionary containing weights
+          prefix (str): Prefix of the weight file.
+          *args:
+        """
+        persistent_buffers = {k: v for k, v in self._buffers.items() if k not in self._non_persistent_buffers_set}
+        local_buffers = {k: v for k, v in persistent_buffers.items() if v is not None}
+
+        for param in local_buffers.keys():
+            for key in state_dict.keys():
+                if key.startswith(prefix) and key[len(prefix) :].split(".")[0] == param:
+                    if not local_buffers[param].shape == state_dict[key].shape:
+                        attribute = self.get_tensor_attribute(param)
+                        attribute.resize_(state_dict[key].shape)
+        super()._load_from_state_dict(state_dict, prefix, *args)
+        
+
+class GaussianKDE(DynamicBufferModule):
+    """Gaussian Kernel Density Estimation.
+    Args:
+        dataset (Optional[Tensor], optional): Dataset on which to fit the KDE model. Defaults to None.
+    """
+
+    def __init__(self, dataset: Optional[Tensor] = None):
+        super().__init__()
+
+        self.register_buffer("bw_transform", Tensor())
+        self.register_buffer("dataset", Tensor())
+        self.register_buffer("norm", Tensor())
+        
+        if dataset is not None:
+            self.fit(dataset)
+        
+        
+    def forward(self, features: Tensor) -> Tensor:
+        """Get the KDE estimates from the feature map.
+        Args:
+          features (Tensor): Feature map extracted from the CNN
+        Returns: KDE Estimates
+        """
+        features = torch.matmul(features, self.bw_transform)
+
+        estimate = torch.zeros(features.shape[0]).to(features.device)
+        for i in range(features.shape[0]):
+            embedding = ((self.dataset - features[i]) ** 2).sum(dim=1)
+            embedding = self.log_norm - (embedding / 2)
+            estimate[i] = torch.mean(embedding)
+        return estimate
+
+
+    def fit(self, dataset: Tensor) -> None:
+        """Fit a KDE model to the input dataset.
+        Args:
+          dataset (Tensor): Input dataset.
+        Returns:
+            None
+        """        
+        num_samples, dimension = dataset.shape
+
+        # compute scott's bandwidth factor
+        factor = num_samples ** (-1 / (dimension + 4))
+
+        cov_mat = self.cov(dataset.T)
+        inv_cov_mat = torch.linalg.inv(cov_mat)
+        inv_cov = inv_cov_mat / factor**2
+        
+        # transform data to account for bandwidth
+        bw_transform = torch.linalg.cholesky(inv_cov)
+        dataset = torch.matmul(dataset, bw_transform)
+        
+        #
+        norm = torch.prod(torch.diag(bw_transform))
+        norm *= math.pow((2 * math.pi), (-dimension / 2))
+
+        self.bw_transform = bw_transform
+        self.dataset = dataset
+        self.norm = norm
+        self.log_norm = torch.log(self.norm)
+        return
+
+
+    @staticmethod
+    def cov(tensor: Tensor) -> Tensor:
+        """Calculate the unbiased covariance matrix.
+        Args:
+            tensor (Tensor): Input tensor from which covariance matrix is computed.
+        Returns:
+            Output covariance matrix.
+        """
+        mean = torch.mean(tensor, dim=1, keepdim=True)
+        cov = torch.matmul(tensor - mean, (tensor - mean).T) / (tensor.size(1) - 1)
+        return cov
+
 
 
 def relative2absolute(x, parents, invert=False, x0=None):
@@ -60,18 +205,6 @@ def get_prediction(data, algo, sample_num, num_seeds=1, concat_hist=True, z=None
         reshape([bs, nj, 3, -1]).reshape([bs, nj, -1])
     inp = inp.unsqueeze(1).repeat([1, cfg.nk, 1, 1]).reshape([bs * cfg.nk, nj, -1])
 
-    # # sample diverse z
-    # z = torch.randn([1, 3, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    # threshold = 30
-    # max_search_step = 1000
-    # for kk in range(sample_num * num_seeds - 1):
-    #     zt = torch.randn([max_search_step, 3, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    #     dist = torch.norm(zt[:, None, :, :] - z[None, :, :, :], dim=-1).mean(dim=[1, 2])
-    #     zt = zt[dist == torch.max(dist)][0]
-    #     z = torch.cat([zt[None, :, :], z], dim=0)
-    # # z = z.reshape([sample_num * num_seeds, X.shape[1], -1])
-    # zz = torch.randn([sample_num * num_seeds, 2, cfg.nf_specs['nz']], dtype=dtype, device=device)
-    # z = torch.cat([zz, z], dim=1)
     if algo == 'gcn':
         z = torch.randn([sample_num * num_seeds, n_parts, cfg.nf_specs['nz']], dtype=dtype, device=device)
         if args.fixlower:
@@ -82,47 +215,10 @@ def get_prediction(data, algo, sample_num, num_seeds=1, concat_hist=True, z=None
             [Y.shape[0], Y.shape[1] * 3, cfg.n_pre]).transpose(1, 2)
         Y = torch.matmul(idct_m_all[:, :cfg.n_pre], Y[:, :cfg.n_pre]).transpose(1, 2)[:, :, t_his:]
         X = traj[..., :t_his].reshape([traj.shape[0], traj.shape[1] * 3, t_his]).repeat([sample_num * num_seeds, 1, 1])
-        # X = X.reshape([X.shape[0], X.shape[1], 3, n_his]).reshape([X.shape[0], X.shape[1] * 3, n_his]).transpose(1, 2)
-        # X = torch.matmul(idct_m_his[:, :n_his], X).transpose(1, 2)
-
-    # # aligh limb length
-    # Y = Y.permute(0, 2, 1).reshape([cfg.nk, t_pred, 16, 3])
-    # yt = torch.zeros([cfg.nk, t_pred, 17, 3], dtype=dtype, device=device)
-    # yt[:, :, 1:] = Y
-    # parents = dataset.skeleton.parents()
-    # yt = relative2absolute(yt, parents)
-    # x0 = torch.tensor(data[:, t_his:], dtype=dtype, device=device)
-    # x0[:, :, 0] = 0
-    # Y = relative2absolute(yt, parents=parents, invert=True, x0=x0)[:, :, 1:]
-    # Y = Y.reshape([cfg.nk, t_pred, -1]).transpose(1, 2)
 
     if concat_hist:
         Y = torch.cat((X, Y), dim=-1)
     Y = Y.permute(0, 2, 1).contiguous().cpu().numpy()
-
-    # n = 5
-    # yt = tensor(Y, dtype=dtype, device=device)
-    # yt = (yt - data_mean) / data_std
-    # z, log_det_jacobian, _, _, _, _ = pose_prior(yt)
-    # prior = torch.distributions.Normal(torch.tensor(0, dtype=dtype, device=device),
-    #                                    torch.tensor(1, dtype=dtype, device=device))
-    # prior_lkh = prior.log_prob(z).sum(dim=2)
-    # prior_logdetjac = log_det_jacobian.sum(dim=2)
-
-    # z = torch.randn([sample_num * num_seeds, 2, 48], dtype=dtype, device=device).reshape(
-    #     [sample_num * num_seeds, 2, -1])
-    # zs = z[:, 0:1]
-    # ze = z[:, -1:]
-    # nf = t_pred + t_his
-    # dz = (ze - zs) / (nf - 1)
-    # zz = []
-    # for i in range(nf):
-    #     zz.append(zs + dz * i)
-    # zz = torch.cat(zz, dim=1)
-    # Y = pose_prior.inverse(zz)
-    # Y = Y.transpose(1, 2)  # .reshape([Y.shape[0], 16, 3, -1])
-    # Y = Y.permute(0, 2, 1).contiguous() * data_std + data_mean
-    # Y = Y.cpu().numpy()
 
     if Y.shape[0] > 1:
         Y = Y.reshape(-1, sample_num, Y.shape[-2], Y.shape[-1])
@@ -143,16 +239,8 @@ def visualize():
     def pose_generator():
 
         while True:
-            # while True:
-            #     data, data_multimodal = dataset.sample(n_modality=10)
-            #     # data = dataset.sample()
-            #     dsum = np.sum(np.abs(data_multimodal), axis=(1, 2, 3))
-            #     if len(np.where(dsum > 0)[0]) == 0:
-            #         break
-
             data, data_multimodal = dataset.sample(n_modality=10)
-            # data_multimodal[:, :, 0] = 0
-            # gt
+
             gt = data[0].copy()
             gt[:, :1, :] = 0
 
@@ -260,76 +348,37 @@ def compute_pz(pred, *args):
     return prior_lkh
 
 
-def compute_stats():
-    stats_func = {'Diversity': compute_diversity, 'ADE': compute_ade,
-                  'FDE': compute_fde, 'MMADE': compute_mmade, 'MMFDE': compute_mmfde, 'NLL': compute_pz}
-    stats_names = list(stats_func.keys())
-    stats_meter = {x: {y: AverageMeter() for y in algos} for x in stats_names}
 
+def compute_stats():
     data_gen = dataset.iter_generator(step=cfg.t_his)
     num_samples = 0
     num_seeds = args.num_seeds
-    iv = 0
+    
+    kde_list = []
     for i, (data, _) in enumerate(data_gen):
         num_samples += 1
         gt = get_gt(data)
-        gt_multi = traj_gt_arr[i]
-        if gt_multi.shape[0] == 1:
-            continue
+        gt = np.reshape(gt, newshape=(gt.shape[0], gt.shape[1], -1, 3))
+        
         for algo in algos:
-            pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False)
-            for stats in stats_names:
-                val = 0
-                for pred_i in pred:
-                    val += stats_func[stats](pred_i, gt, gt_multi) / num_seeds
-                # if val > 50 and stats == 'Diversity':
-                #     iv += 1
-                #     break
-                stats_meter[stats][algo].update(val)
-        print('-' * 80)
-        for stats in stats_names:
-            str_stats = f'{num_samples:04d} {stats}: ' + ' '.join(
-                [f'{x}: {y.val:.4f}({y.avg:.4f})' for x, y in stats_meter[stats].items()])
-            print(str_stats)
-        # break
-    print(f'invalid samples {iv}, rate {iv / (nk * (i + 1))}')
-    logger.info('=' * 80)
-    surfix = f'#epo{args.iter_gcn}_fixlower_{args.fixlower}_nk{nk}_th{args.multimodal_threshold:.2f}'
-    logger.info(surfix)
-    for stats in stats_names:
-        str_stats = f'Total {stats}: ' + ' '.join([f'{x}: {y.avg:.4f}' for x, y in stats_meter[stats].items()])
-        logger.info(str_stats)
-    logger.info('=' * 80)
+            pred_thousand = []
+            '''
+            for j in range(20):
+                pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False) # (1, 50, 60, 42)
+                pred = np.reshape(pred, newshape=(pred.shape[0], pred.shape[1], pred.shape[2], -1, 3))
+                pred_thousand.append(pred)
+            pred_thousand = np.concatenate(pred_thousand, axis=1)
+            pred = pred_thousand
+            '''
+            pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False) # (1, 50, 60, 42)
+            pred = np.reshape(pred, newshape=(pred.shape[0], pred.shape[1], pred.shape[2], -1, 3))
+            
+            kde_list.append(kde(y=gt, y_pred=pred))
+    kde_ll = torch.cat(kde_list, dim=0)
+    kde_ll = torch.mean(kde_ll, dim=0)
+    kde_ll_np = kde_ll.to('cpu').numpy()
+    print(kde_ll_np)
 
-    # with open('%s/stats_%s.csv' % (cfg.result_dir, args.num_seeds), 'w') as csv_file:
-    #     writer = csv.DictWriter(csv_file, fieldnames=['Metric'] + algos)
-    #     writer.writeheader()
-    #     for stats, meter in stats_meter.items():
-    #         new_meter = {x: y.avg for x, y in meter.items()}
-    #         new_meter['Metric'] = stats
-    #         writer.writerow(new_meter)
-
-    whead = False
-    if not os.path.exists('%s/stats_%s.csv' % (cfg.result_dir, args.num_seeds)):
-        whead = True
-    with open('%s/stats_%s.csv' % (cfg.result_dir, args.num_seeds), 'a') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=['method'] + list(stats_meter.keys()))
-        if whead:
-            writer.writeheader()
-        dict = {}
-        for stats, meter in stats_meter.items():
-            # print(stats)
-            for x, y in meter.items():
-                # print(x, y.avg)
-                na = f'{x}_{surfix}'
-                if na not in dict.keys():
-                    dict[na] = {}
-                dict[na][stats] = y.avg
-
-        for stats, values in dict.items():
-            new_meter = {x: y for x, y in values.items()}
-            new_meter['method'] = stats
-            writer.writerow(new_meter)
 
 
 def get_multimodal_gt():
@@ -383,11 +432,11 @@ def get_multimodal_gt2():
 
 
 if __name__ == '__main__':
-
     all_algos = ['gcn']
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg',
-                        default='humaneva')
+    parser.add_argument('--cfg', default='h36m')
+    # parser.add_argument('--cfg', default='humaneva')
+    
     parser.add_argument('--mode', default='stats')
     parser.add_argument('--data', default='test')
     parser.add_argument('--action', default='all')
@@ -399,7 +448,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_pre', type=int, default=10)
     parser.add_argument('--n_his', type=int, default=5)
     parser.add_argument('--trial', type=int, default=1)
-    parser.add_argument('--nk', type=int, default=5)
+    parser.add_argument('--nk', type=int, default=1000)
     parser.add_argument('--fixlower', action='store_true', default=False)
     parser.add_argument('--num_coupling_layer', type=int, default=4)
     for algo in all_algos:
@@ -421,9 +470,6 @@ if __name__ == '__main__':
 
     algos = []
     for algo in all_algos:
-        # iter_algo = 'iter_%s' % algo
-        # num_algo = 'num_vae_epoch'  # % algo
-        # setattr(args, iter_algo, getattr(cfg, num_algo))
         algos.append(algo)
     vis_algos = algos.copy()
 
@@ -459,15 +505,13 @@ if __name__ == '__main__':
                               'multimodal_path'] if 'multimodal_path' in cfg.nf_specs.keys() else None,
                           data_candi_path=cfg.nf_specs[
                               'data_candi_path'] if 'data_candi_path' in cfg.nf_specs.keys() else None)
-    if args.data == 'test':
-        traj_gt_arr = get_multimodal_gt()
+    # if args.data == 'test':
+    #     traj_gt_arr = get_multimodal_gt()
 
     """models"""
     model_generator = {
         'gcn': get_model
-        # ,
         # 'dlow': get_dlow_model,
-
     }
     models = {}
     for algo in algos:
