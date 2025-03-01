@@ -12,8 +12,11 @@ from motion_pred.utils.visualization import render_animation, render_animation_v
 from models.motion_pred_ours import *
 from scipy.spatial.distance import pdist, squareform
 from models import LinNF
-
 from utils import util
+from FID.fid import fid
+from FID.fid_classifier import classifier_fid_factory, classifier_fid_humaneva_factory
+import re
+
 
 
 def relative2absolute(x, parents, invert=False, x0=None):
@@ -382,13 +385,161 @@ def get_multimodal_gt2():
     return traj_gt_arr
 
 
-if __name__ == '__main__':
 
+def FID_test(classifier):
+    data_gen = dataset.iter_generator_v2(step=cfg.t_his, afg=True)
+    num_samples = 0
+    num_seeds = args.num_seeds
+    
+    pred_act_list, gt_act_list = [], []
+    for i, (data, action) in enumerate(data_gen):
+        num_samples += 1
+        gt = get_gt(data)
+        
+        gt = np.repeat(gt, cfg.nk, axis=0)
+        gt = np.swapaxes(gt, 1, 2)
+        gt = torch.tensor(gt, device=device)        
+        
+        for algo in algos:
+            if algo == 'vae':
+                continue
+            pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False)
+            pred = np.swapaxes(pred, -2, -1)
+            
+            pred = pred.reshape(cfg.nk, pred.shape[-2], pred.shape[-1])
+            pred = torch.tensor(pred, device=device, dtype=torch.float32)
+
+            pred_activations = classifier.get_fid_features(motion_sequence=pred).cpu().data.numpy()
+            gt_activations   = classifier.get_fid_features(motion_sequence=gt).cpu().data.numpy()
+        
+            pred_act_list.append(pred_activations)
+            gt_act_list.append(gt_activations)
+        
+    results_fid = fid(np.concatenate(pred_act_list, 0), np.concatenate(gt_act_list, 0))
+    print(results_fid)
+
+
+def CMD_test():
+    idx_to_class = ['directions', 'discussion', 'eating', 'greeting', 'phoning', \
+                    'posing', 'purchases', 'sitting', 'sittingdown', 'smoking',  \
+                    'photo', 'waiting', 'walking', 'walkdog', 'walktogether']
+    # idx_to_class = ['Directions', 'Discussion', 'Eating', 'Greeting', 'Phoning', \
+    #                 'Posing', 'Purchases', 'Sitting', 'SittingDown', 'Smoking',  \
+    #                 'Photo', 'Waiting', 'Walking', 'WalkDog', 'WalkTogether']
+    mean_motion_per_class = [0.004528946212615328, 0.005068199383505345, 0.003978791804673771,  0.005921345536787865,   0.003595039379111546, 
+                            0.004192961478268034, 0.005664689143238568, 0.0024945400286369122, 0.003543066357658834,   0.0035990843311130487, 
+                            0.004356865838457266, 0.004219841185066826, 0.007528046315984569,  0.00007054820734533077, 0.006751761745020258]  
+
+    def CMD(val_per_frame, val_ref):
+        T = len(val_per_frame) + 1
+        return np.sum([(T - t) * np.abs(val_per_frame[t-1] - val_ref) for t in range(1, T)])
+
+    def CMD_helper(pred):
+        pred_flat = pred   # shape: [batch, num_s, t_pred, joint, 3]
+        # M = (torch.linalg.norm(pred_flat[:,:,1:] - pred_flat[:,:,:-1], axis=-1)).mean(axis=1).mean(axis=-1)    
+        M = np.linalg.norm(pred_flat[:,:,1:] - pred_flat[:,:,:-1], axis=-1).mean(axis=1).mean(axis=-1) 
+        return M
+
+    def CMD_pose(data, label):
+        ret = 0
+        # CMD weighted by class
+        for i, (name, class_val_ref) in enumerate(zip(idx_to_class, mean_motion_per_class)):
+            mask = label == name
+            if mask.sum() == 0:
+                continue
+            motion_data_mean = data[mask].mean(axis=0)
+            ret += CMD(motion_data_mean, class_val_ref) * (mask.sum() / label.shape[0])
+        return ret
+
+    data_gen = dataset.iter_generator_v2(step=cfg.t_his, afg=True)
+    num_samples = 0
+    num_seeds = 1
+
+    M_list, label_list = [], []
+    for data, action in data_gen:
+        for algo in algos:
+            if algo == 'vae':
+                continue
+            action = str.lower(re.sub(r'[0-9]+', '', action))
+            action = re.sub(" ", "", action)
+            
+            num_samples += 1
+            gt = get_gt(data)
+            
+            pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False)
+            pred = pred.reshape(1, cfg.nk, 100, 16, 3)
+            
+            M = CMD_helper(pred)
+            M_list.append(M)
+            label_list.append(action)
+
+    M_all = np.concatenate(M_list, 0)
+    label_all = np.array(label_list)
+    
+    cmd_score = CMD_pose(M_all, label_all) 
+    print(cmd_score)
+    return
+
+
+def CMD_test_eva():
+    idx_to_class = ['Box', 'Gestures', 'Jog', 'ThrowCatch', 'Walking']
+    mean_motion_per_class = [0.010139551, 0.0021507503, 0.010850595,  0.004398426,   0.006771291]  
+
+    def CMD(val_per_frame, val_ref):
+        T = len(val_per_frame) + 1
+        return np.sum([(T - t) * np.abs(val_per_frame[t-1] - val_ref) for t in range(1, T)])
+
+    def CMD_helper(pred):
+        pred_flat = pred   # shape: [batch, num_s, t_pred, joint, 3] 
+        M = np.linalg.norm(pred_flat[:,:,1:] - pred_flat[:,:,:-1], axis=-1).mean(axis=1).mean(axis=-1) 
+        return M
+
+    def CMD_pose(data, label):
+        ret = 0
+        # CMD weighted by class
+        for i, (name, class_val_ref) in enumerate(zip(idx_to_class, mean_motion_per_class)):
+            mask = label == name
+            if mask.sum() == 0:
+                continue
+            motion_data_mean = data[mask].mean(axis=0)
+            ret += CMD(motion_data_mean, class_val_ref) * (mask.sum() / label.shape[0])
+        return ret
+
+    data_gen = dataset.iter_generator_v2(step=cfg.t_his, afg=True)
+    num_samples = 0
+    num_seeds = 1
+
+    M_list, label_list = [], []
+    for data, action in data_gen:
+        for algo in algos:
+            if algo == 'vae':
+                continue
+            
+            num_samples += 1
+            gt = get_gt(data)
+            
+            pred = get_prediction(data, algo, sample_num=cfg.nk, num_seeds=num_seeds, concat_hist=False)
+            pred = pred.reshape(1, cfg.nk, cfg.t_pred, -1, 3)
+            
+            M = CMD_helper(pred)
+            M_list.append(M)
+            label_list.append(action)
+
+    M_all = np.concatenate(M_list, 0)
+    label_all = np.array(label_list)
+    
+    cmd_score = CMD_pose(M_all, label_all) 
+    print(cmd_score)
+    return
+
+
+
+if __name__ == '__main__':
     all_algos = ['gcn']
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg',
-                        default='humaneva')
-    parser.add_argument('--mode', default='stats')
+                        default='h36m')
+    parser.add_argument('--mode', default='CMD')
     parser.add_argument('--data', default='test')
     parser.add_argument('--action', default='all')
     parser.add_argument('--num_seeds', type=int, default=1)
@@ -496,3 +647,14 @@ if __name__ == '__main__':
         visualize()
     elif args.mode == 'stats':
         compute_stats()
+
+    elif args.mode == 'FID':
+        classifier = classifier_fid_factory(device) if cfg.dataset == 'h36m' else classifier_fid_humaneva_factory(device)
+        FID_test(classifier)
+
+    elif args.mode == 'CMD':
+        with torch.no_grad():
+            if cfg.dataset == 'h36m':
+                CMD_test()
+            else:
+                CMD_test_eva() 

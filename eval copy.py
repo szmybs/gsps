@@ -419,7 +419,6 @@ def get_multimodal_gt2():
 
 
 if __name__ == '__main__':
-
     all_algos = ['gcn']
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', default='h36m')

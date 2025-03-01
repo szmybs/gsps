@@ -214,6 +214,18 @@ class DatasetH36M(Dataset):
                     yield traj, traj_multi
 
 
+    def iter_generator_v2(self, step=25, afg=False):
+        for data_s in self.data.values():
+            for act, seq in data_s.items():
+                seq_len = seq.shape[0]
+                for i in range(0, seq_len - self.t_total, step):
+                    traj = seq[None, i: i + self.t_total]
+                    if afg:
+                        yield traj, act
+                    else:
+                        yield traj
+
+
 if __name__ == '__main__':
     np.random.seed(0)
     actions = {'WalkDog'}
